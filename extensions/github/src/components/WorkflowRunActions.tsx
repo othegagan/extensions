@@ -1,11 +1,15 @@
-import { Action, ActionPanel, Icon, List, showToast, Toast, Keyboard } from "@raycast/api";
+import { Action, ActionPanel, Cache, Clipboard, Icon, Keyboard, List, open, showToast, Toast } from "@raycast/api";
 
 import { getGitHubClient } from "../api/githubClient";
 import { RevalidateList } from "../helpers";
 import { getErrorMessage } from "../helpers/errors";
+import { getPreviewUrlErrorMessage, getPreviewUrlFromRun } from "../helpers/workflow-preview-run";
 import { WorkflowRunsResponse } from "../workflow-runs";
 
 export type WorkflowRun = WorkflowRunsResponse["data"]["workflow_runs"][0];
+
+const PREVIEW_WORKFLOW_NAME_HINTS = ["deployment", "feature branch"];
+const previewUrlCache = new Cache({ namespace: "workflow-preview-urls" });
 
 type WorkflowRunActionsProps = {
   workflowRun: WorkflowRun;
@@ -17,6 +21,11 @@ export function WorkflowRunActions({ workflowRun, repository, mutateList }: Work
   const { octokit } = getGitHubClient();
 
   const [owner, repo] = repository.split("/");
+
+  const canHavePreview = PREVIEW_WORKFLOW_NAME_HINTS.some((hint) =>
+    (workflowRun.name ?? "").toLowerCase().includes(hint),
+  );
+  const previewUrlCacheKey = `${owner}/${repo}/${workflowRun.id}`;
 
   const commit = workflowRun.head_sha.slice(0, 7);
   const keywords: List.Item.Props["keywords"] = [workflowRun.head_sha];
@@ -122,9 +131,74 @@ export function WorkflowRunActions({ workflowRun, repository, mutateList }: Work
     }
   }
 
+  async function withPreviewUrl(action: "open" | "copy") {
+    await showToast({ style: Toast.Style.Animated, title: "Fetching preview URL…" });
+
+    try {
+      const cachedUrl = previewUrlCache.get(previewUrlCacheKey);
+      const previewUrl = cachedUrl ?? (await getPreviewUrlFromRun(owner, repo, workflowRun.id));
+
+      if (!previewUrl) {
+        await showToast({
+          style: Toast.Style.Failure,
+          title: workflowRun.status === "completed" ? "No preview URL found" : "Preview not ready yet",
+          message:
+            workflowRun.status === "completed"
+              ? "This run didn't publish a Vercel preview, or its logs have expired."
+              : "The run is still in progress. Try again once the deploy job finishes.",
+        });
+        return;
+      }
+
+      if (!cachedUrl && workflowRun.status === "completed") {
+        previewUrlCache.set(previewUrlCacheKey, previewUrl);
+      }
+
+      if (action === "open") {
+        await open(previewUrl);
+        await showToast({ style: Toast.Style.Success, title: "Opened preview URL" });
+      } else {
+        await Clipboard.copy(previewUrl);
+        await showToast({ style: Toast.Style.Success, title: "Copied preview URL", message: previewUrl });
+      }
+    } catch (error) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: "Failed fetching preview URL",
+        message: getPreviewUrlErrorMessage(error),
+      });
+    }
+  }
+
+  async function openPreviewUrl() {
+    await withPreviewUrl("open");
+  }
+
+  async function copyPreviewUrl() {
+    await withPreviewUrl("copy");
+  }
+
   return (
     <ActionPanel title={commit}>
       <Action.OpenInBrowser url={workflowRun.html_url} />
+
+      {canHavePreview ? (
+        <Action
+          title="Open Preview URL"
+          icon={Icon.Globe}
+          onAction={openPreviewUrl}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "p" }}
+        />
+      ) : null}
+
+      {canHavePreview ? (
+        <Action
+          title="Copy Preview URL"
+          icon={Icon.Clipboard}
+          onAction={copyPreviewUrl}
+          shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+        />
+      ) : null}
 
       {workflowRun.status === "completed" ? (
         <Action title="Rerun Workflow" icon={Icon.Clock} onAction={rerunWorkflow} />
